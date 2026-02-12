@@ -1,0 +1,228 @@
+#include <ESP32Servo.h>
+#include <Arduino.h>
+#include <FirebaseClient.h>
+#include "ExampleFunctions.h"
+
+// =================== Pin Definitions =====================
+#define OPEN_POS 0
+#define CLOSE_POS 90
+
+#define IR_PIN 8 // Beam break sensor pin (input_pullup)
+
+#define RED_PIN    6
+#define YELLOW_PIN 5
+#define GREEN_PIN  4
+#define BLUE_PIN   3
+
+#define R2 30000 // voltage sensor resistor
+#define R1 7500
+
+#define VSENS_PIN A1 // Voltage sensor analog pin
+
+// =================== Wi-Fi and Firebase ===================
+#define WIFI_SSID "ssid"
+#define WIFI_PASSWORD "password"
+
+#define API_KEY "api"
+#define DATABASE_URL "https://URL"
+#define USER_EMAIL "email"
+#define USER_PASSWORD "pass!"
+
+// =================== Globals ===================
+Servo myservo;
+SSL_CLIENT ssl_client;
+using AsyncClient = AsyncClientClass;
+AsyncClient aClient(ssl_client);
+UserAuth user_auth(API_KEY, USER_EMAIL, USER_PASSWORD, 3000);
+FirebaseApp app;
+RealtimeDatabase Database;
+AsyncResult databaseResult;
+
+enum State { WAIT_FOR_MOUSE, WAIT_FOR_RELEASE, WAIT_FOR_RESET };
+State currentState = WAIT_FOR_MOUSE;
+
+volatile bool mouse_detected = false;
+
+// =================== Function Declarations ===================
+void WiFi_Setup();
+void Battery_State();
+void Initialize();
+bool Release_Mouse();
+
+// Firebase Setters
+void fireSet_mouse_caught(bool mouseCaught);
+void fireSet_battery_level(double batteryLevel);
+void fireSet_release_mouse(bool releaseMouse);
+void fireSet_reset(bool reset);
+
+// Firebase Getters
+bool fireGet_release_mouse();
+bool fireGet_reset();
+
+// ISR: Beam broken interrupt
+void IRAM_ATTR beamBroken() {
+    mouse_detected = true;
+}
+
+// =================== SETUP ===================
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(RED_PIN, OUTPUT);
+    pinMode(YELLOW_PIN, OUTPUT);
+    pinMode(GREEN_PIN, OUTPUT);
+    pinMode(BLUE_PIN, OUTPUT);
+
+    myservo.attach(10);
+
+    pinMode(IR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(IR_PIN), beamBroken, FALLING);
+
+    WiFi_Setup();
+    Initialize();
+}
+
+// =================== LOOP ===================
+void loop() {
+    app.loop(); // Firebase background tasks
+    Battery_State(); // Battery monitoring
+
+    switch (currentState) {
+        case WAIT_FOR_MOUSE:
+            Serial.println("Going into Deep Sleep waiting for mouse...");
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            esp_sleep_enable_ext0_wakeup(GPIO_NUM_8, 0); // Wake on beam break (LOW)
+            esp_deep_sleep_start();
+            break;
+
+        case WAIT_FOR_RELEASE:
+            if (Release_Mouse()) {
+                currentState = WAIT_FOR_RESET;
+            }
+            break;
+
+        case WAIT_FOR_RESET:
+            if (fireGet_reset()) {
+                Initialize();
+                currentState = WAIT_FOR_MOUSE;
+            }
+            break;
+    }
+
+    delay(5); // Light breathing delay
+}
+
+// =================== OTHER FUNCTIONS ===================
+void Initialize() {
+    Serial.println("Initializing...");
+    fireSet_mouse_caught(false);
+    fireSet_release_mouse(false);
+    fireSet_reset(false);
+    digitalWrite(BLUE_PIN, LOW);
+    digitalWrite(RED_PIN, LOW);
+    digitalWrite(YELLOW_PIN, LOW);
+    digitalWrite(GREEN_PIN, LOW);
+    myservo.write(OPEN_POS);
+}
+
+void WiFi_Setup() {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("Connecting to Wi-Fi");
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(300);
+    }
+    Serial.println("\nConnected with IP: " + WiFi.localIP().toString());
+    Firebase.printf("Firebase Client v%s\n", FIREBASE_CLIENT_VERSION);
+
+    set_ssl_client_insecure_and_buffer(ssl_client);
+
+    Serial.println("Initializing Firebase...");
+    initializeApp(aClient, app, getAuth(user_auth), 120 * 1000, auth_debug_print);
+    app.getApp<RealtimeDatabase>(Database);
+    Database.url(DATABASE_URL);
+}
+
+void Battery_State() {
+    static unsigned long lastUpdate = 0;
+    if (WiFi.status() == WL_CONNECTED && millis() - lastUpdate > 10000) {
+        lastUpdate = millis();
+        int sensor_value = analogRead(VSENS_PIN);
+        double voltage = sensor_value * (3.3 / 4095.0);
+        double batteryLevel = voltage * (R1 + R2) / R2;
+
+        fireSet_battery_level(batteryLevel);
+
+        digitalWrite(RED_PIN, batteryLevel < 6.5 ? HIGH : LOW);
+        digitalWrite(YELLOW_PIN, (batteryLevel > 6.5 && batteryLevel <= 7.5) ? HIGH : LOW);
+        digitalWrite(GREEN_PIN, (batteryLevel > 7.5 && batteryLevel <= 9.0) ? HIGH : LOW);
+
+        Serial.print("Battery Voltage: ");
+        Serial.print(batteryLevel);
+        Serial.println(" V");
+    }
+}
+
+bool Release_Mouse() {
+    if (fireGet_release_mouse()) {
+        digitalWrite(BLUE_PIN, LOW);
+        myservo.write(OPEN_POS);
+        fireSet_mouse_caught(false);
+        fireSet_release_mouse(false);
+        Serial.println("Mouse Released!");
+        return true;
+    }
+    return false;
+}
+
+// =================== FIREBASE FUNCTIONS ===================
+// Setters
+void fireSet_mouse_caught(bool mouseCaught) {
+    if (Database.set<bool>(aClient, "/trap/mouse_caught", mouseCaught))
+        Serial.println("Set mouse_caught successfully");
+    else
+        Firebase.printf("Failed to set mouse_caught: %s\n", aClient.lastError().message().c_str());
+}
+
+void fireSet_battery_level(double batteryLevel) {
+    if (Database.set<double>(aClient, "/trap/battery_level", batteryLevel))
+        Serial.println("Set battery_level successfully");
+    else
+        Firebase.printf("Failed to set battery_level: %s\n", aClient.lastError().message().c_str());
+}
+
+void fireSet_release_mouse(bool releaseMouse) {
+    if (Database.set<bool>(aClient, "/trap/release_mouse", releaseMouse))
+        Serial.println("Set release_mouse successfully");
+    else
+        Firebase.printf("Failed to set release_mouse: %s\n", aClient.lastError().message().c_str());
+}
+
+void fireSet_reset(bool reset) {
+    if (Database.set<bool>(aClient, "/trap/reset", reset))
+        Serial.println("Set reset successfully");
+    else
+        Firebase.printf("Failed to set reset: %s\n", aClient.lastError().message().c_str());
+}
+
+// Getters
+bool fireGet_release_mouse() {
+    bool value = false;
+    value = Database.get<bool>(aClient, "/trap/release_mouse");
+    if (aClient.lastError().code() == 0)
+        Serial.println("Got release_mouse successfully");
+    else
+        Firebase.printf("Failed to get release_mouse: %s\n", aClient.lastError().message().c_str());
+    return value;
+}
+
+bool fireGet_reset() {
+    bool value = false;
+    value = Database.get<bool>(aClient, "/trap/reset");
+    if (aClient.lastError().code() == 0)
+        Serial.println("Got reset successfully");
+    else
+        Firebase.printf("Failed to get reset: %s\n", aClient.lastError().message().c_str());
+    return value;
+}
